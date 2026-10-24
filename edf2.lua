@@ -1,188 +1,220 @@
+--!strict
 --[[
-    invisibility_bundle.lua
-    Target: Roblox / Luau executor (Synapse, Fluxus, Delta, Xeno, Wave ...)
-    Один файл, всё внутри.
-
-    Что делает:
-      1) Если USE_RAW = true — перехватывает buffer.fromstring и складывает
-         реальный Luraph-байткод из gB в luraph_payload.bin.
-         Потом запускает оригинальный обфусцированный файл и печатает ошибку,
-         если он падает (а он упадёт — там сломанный вызов :HB()).
-      2) В любом случае работает рабочий клиентский invisibility для LocalPlayer.
-
-    Управление после загрузки:
-      _G.Inv:toggle()               -- вкл/выкл
-      _G.Inv:set_invisible(true)    -- принудительно вкл
-      _G.Inv:set_invisible(false)   -- принудительно выкл
-      _G.Inv:dump()                 -- повторный дамп обфусцированного файла
+    TSB Invisibility / Readable Luau remake
+    Important: this is a NEW implementation, not decrypted code from Luraph.
+    This only hides your own character on YOUR CLIENT.
+    Other players can still see you; TSB server hitboxes/combat remain unaffected.
+    Run as a LocalScript in StarterPlayerScripts when testing in Roblox Studio.
 ]]
 
--- ═══════════════════════════════════════════════════════════════════
--- НАСТРОЙКИ
--- ═══════════════════════════════════════════════════════════════════
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local player = Players.LocalPlayer
+if not player then
+    error("This script must run on a Roblox client (LocalScript).")
+end
 
-local USE_RAW           = false   -- true → сначала дампер Luraph, потом инвиз
-local RAW_SCRIPT        = "invisibility.lua.txt"  -- имя файла на диске
-local DUMP_PATH         = "luraph_payload.bin"
+-- Prevent duplicate state/GUI on script rerun.
+local global = (_G :: any)
+if type(global.__TSB_Invisibility_LocalCleanup) == "function" then
+    pcall(global.__TSB_Invisibility_LocalCleanup)
+end
 
-local INVISIBLE         = true    -- главный переключатель инвиза
-local HIDE_NAME         = true    -- скрыть ник над головой
-local HIDE_TOOLS        = true    -- спрятать предметы в руках
-local HIDE_ACCESSORIES  = false   -- спрятать шляпы/аксессуары
-local HIDE_SHADOW       = true    -- убрать тень
+local enabled = false
+local character: Model? = nil
+local addedConnection: RBXScriptConnection? = nil
+local characterConnection: RBXScriptConnection? = nil
+local keyConnection: RBXScriptConnection? = nil
+local renderConnection: RBXScriptConnection? = nil
+local saved: {[Instance]: {[string]: any}} = {}
+local tracked: {[BasePart]: boolean} = {}
 
--- ═══════════════════════════════════════════════════════════════════
--- ЧАСТЬ 1 — ДАМПЕР LURAPH PAYLOAD
--- ═══════════════════════════════════════════════════════════════════
-
-local function dump_luraph_payload()
-    local ok_bf, orig_fromstring = pcall(function() return buffer.fromstring end)
-    if not ok_bf or type(orig_fromstring) ~= "function" then
-        warn("[dump] buffer.fromstring недоступен — экзекутор не поддерживает buffer API")
+local function changeProperty(instance: Instance, property: string, value: any)
+    local oldValue: any
+    local ok = pcall(function()
+        oldValue = (instance :: any)[property]
+    end)
+    if not ok then
         return
     end
 
-    local hooked = false
-    buffer.fromstring = function(s, ...)
-        if not hooked and type(s) == "string" and #s > 64 then
-            hooked = true
-            local wf = rawget(getfenv(), "writefile") or writefile
-            if wf then
-                local ok, err = pcall(wf, DUMP_PATH, s)
-                if ok then
-                    print(("[dump] payload dumped → %s (%d bytes)"):format(DUMP_PATH, #s))
-                else
-                    warn("[dump] writefile fail:", err)
-                end
-            end
-        end
-        return orig_fromstring(s, ...)
+    local record = saved[instance]
+    if not record then
+        record = {}
+        saved[instance] = record
+    end
+    if record[property] == nil then
+        record[property] = oldValue
     end
 
-    local ok_rf, src = pcall(function() return readfile(RAW_SCRIPT) end)
-    if not ok_rf or type(src) ~= "string" then
-        warn("[dump] не нашёл "..RAW_SCRIPT.." — положи файл рядом в workspace экзекутора")
+    pcall(function()
+        (instance :: any)[property] = value
+    end)
+end
+
+local function hideInstance(instance: Instance)
+    if instance:IsA("BasePart") then
+        -- LocalTransparencyModifier is intentionally client-side only.
+        changeProperty(instance, "LocalTransparencyModifier", 1)
+        tracked[instance] = true
+    elseif instance:IsA("Decal") or instance:IsA("Texture") then
+        changeProperty(instance, "Transparency", 1)
+    elseif instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam") then
+        changeProperty(instance, "Enabled", false)
+    elseif instance:IsA("Fire") or instance:IsA("Smoke") or instance:IsA("Sparkles") then
+        changeProperty(instance, "Enabled", false)
+    elseif instance:IsA("Highlight") or instance:IsA("BillboardGui") then
+        changeProperty(instance, "Enabled", false)
+    end
+end
+
+local function restoreAll()
+    for instance, properties in pairs(saved) do
+        if instance.Parent ~= nil then
+            for property, oldValue in pairs(properties) do
+                pcall(function()
+                    (instance :: any)[property] = oldValue
+                end)
+            end
+        end
+    end
+    table.clear(saved)
+    table.clear(tracked)
+end
+
+local function bindCharacter(newCharacter: Model)
+    if addedConnection then
+        addedConnection:Disconnect()
+        addedConnection = nil
+    end
+    restoreAll()
+    character = newCharacter
+
+    addedConnection = newCharacter.DescendantAdded:Connect(function(instance)
+        if enabled then
+            hideInstance(instance)
+        end
+    end)
+
+    if enabled then
+        for _, instance in ipairs(newCharacter:GetDescendants()) do
+            hideInstance(instance)
+        end
+    end
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "TSB_Invisibility_LocalOnly"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.DisplayOrder = 100
+
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.fromOffset(216, 96)
+panel.Position = UDim2.new(0.5, -108, 0, 85)
+panel.BackgroundColor3 = Color3.fromRGB(29, 32, 41)
+panel.BorderSizePixel = 0
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, -16, 0, 32)
+title.Position = UDim2.fromOffset(8, 4)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextColor3 = Color3.fromRGB(244, 244, 244)
+title.Text = "TSB / Local Invisibility"
+title.Parent = panel
+
+local button = Instance.new("TextButton")
+button.Name = "Toggle"
+button.Size = UDim2.new(1, -18, 0, 40)
+button.Position = UDim2.fromOffset(9, 45)
+button.BorderSizePixel = 0
+button.BackgroundColor3 = Color3.fromRGB(72, 77, 89)
+button.TextColor3 = Color3.fromRGB(255, 255, 255)
+button.Font = Enum.Font.GothamBold
+button.TextSize = 14
+button.Parent = panel
+Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
+
+local function updateButton()
+    button.Text = enabled and "INVISIBLE: ON  [I]" or "INVISIBLE: OFF  [I]"
+    button.BackgroundColor3 = enabled
+        and Color3.fromRGB(45, 135, 110)
+        or Color3.fromRGB(72, 77, 89)
+end
+
+local function setEnabled(value: boolean)
+    if enabled == value then
         return
     end
+    enabled = value
+    if enabled then
+        if character then
+            for _, instance in ipairs(character:GetDescendants()) do
+                hideInstance(instance)
+            end
+        end
+    else
+        restoreAll()
+    end
+    updateButton()
+end
 
-    local fn, load_err = loadstring(src)
-    if not fn then
-        warn("[dump] loadstring fail:", load_err)
+button.MouseButton1Click:Connect(function()
+    setEnabled(not enabled)
+end)
+
+keyConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then
         return
     end
+    if input.KeyCode == Enum.KeyCode.I then
+        setEnabled(not enabled)
+    end
+end)
 
-    local ok_run, run_err = pcall(fn)
-    print(("[dump] raw run: ok=%s err=%s"):format(tostring(ok_run), tostring(run_err)))
+characterConnection = player.CharacterAdded:Connect(bindCharacter)
+if player.Character then
+    bindCharacter(player.Character)
 end
 
--- ═══════════════════════════════════════════════════════════════════
--- ЧАСТЬ 2 — РАБОЧИЙ INVISIBILITY (LocalPlayer)
--- ═══════════════════════════════════════════════════════════════════
-
-local Players    = game:GetService("Players")
-local lp         = Players.LocalPlayer
-
-local function hide_char(char)
-    char = char or lp.Character
-    if not char then return end
-
-    for _, obj in ipairs(char:GetDescendants()) do
-        if obj:IsA("BasePart") then
-            obj.Transparency = 1
-            obj.CanCollide = false
-            obj.CastShadow = 0
-        elseif obj:IsA("Decal") then
-            obj.Transparency = 1
-        elseif obj:IsA("BillboardGui") and HIDE_NAME then
-            obj.Enabled = false
-        elseif obj:IsA("Accessory") and HIDE_ACCESSORIES then
-            for _, p in ipairs(obj:GetDescendants()) do
-                if p:IsA("BasePart") or p:IsA("Decal") then p.Transparency = 1 end
+-- Some character scripts rewrite local transparency every render frame.
+-- Maintain our visual override while enabled, without touching any server state.
+renderConnection = RunService.RenderStepped:Connect(function()
+    if not enabled then
+        return
+    end
+    for part in pairs(tracked) do
+        if part.Parent then
+            if part.LocalTransparencyModifier ~= 1 then
+                part.LocalTransparencyModifier = 1
             end
-        elseif obj:IsA("Tool") and HIDE_TOOLS then
-            for _, p in ipairs(obj:GetDescendants()) do
-                if p:IsA("BasePart") then p.Transparency = 1 end
-            end
+        else
+            tracked[part] = nil
         end
     end
+end)
 
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum then
-        hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+local function cleanup()
+    enabled = false
+    if addedConnection then addedConnection:Disconnect() end
+    if characterConnection then characterConnection:Disconnect() end
+    if keyConnection then keyConnection:Disconnect() end
+    if renderConnection then renderConnection:Disconnect() end
+    restoreAll()
+    gui:Destroy()
+    if global.__TSB_Invisibility_LocalCleanup == cleanup then
+        global.__TSB_Invisibility_LocalCleanup = nil
     end
 end
 
-local function show_char(char)
-    char = char or lp.Character
-    if not char then return end
-
-    for _, obj in ipairs(char:GetDescendants()) do
-        if obj:IsA("BasePart") then
-            obj.Transparency = 0
-            obj.CastShadow = 1
-        elseif obj:IsA("Decal") then
-            obj.Transparency = 0
-        elseif obj:IsA("BillboardGui") then
-            obj.Enabled = true
-        elseif obj:IsA("Accessory") or obj:IsA("Tool") then
-            for _, p in ipairs(obj:GetDescendants()) do
-                if p:IsA("BasePart") or p:IsA("Decal") then p.Transparency = 0 end
-            end
-        end
-    end
-
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum then
-        hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.Viewer
-    end
-end
-
-local conns = {}
-
-local function hook_char(char)
-    for _, c in ipairs(conns) do c:Disconnect() end
-    conns = {}
-    if not char then return end
-
-    if INVISIBLE then hide_char(char) end
-
-    table.insert(conns, char.DescendantAdded:Connect(function()
-        if INVISIBLE then task.defer(function() pcall(hide_char, char) end) end
-    end))
-
-    local hum = char:WaitForChild("Humanoid", 5)
-    if hum then
-        table.insert(conns, hum:GetPropertyChangedSignal("Health"):Connect(function()
-            if INVISIBLE and hum.Health > 0 then hide_char(char) end
-        end))
-    end
-end
-
-lp.CharacterAdded:Connect(hook_char)
-if lp.Character then hook_char(lp.Character) end
-
--- ═══════════════════════════════════════════════════════════════════
--- ПУБЛИЧНОЕ API
--- ═══════════════════════════════════════════════════════════════════
-
-local api = {}
-function api.set_invisible(v)
-    INVISIBLE = v and true or false
-    if INVISIBLE then hide_char() else show_char() end
-    print("[invis]", INVISIBLE and "ON" or "OFF")
-end
-function api.toggle() api.set_invisible(not INVISIBLE) end
-function api.dump() dump_luraph_payload() end
-
-_G.Inv = api
-print("[invis] loaded. _G.Inv:toggle() / _G.Inv:set_invisible(bool) / _G.Inv:dump()")
-
--- ═══════════════════════════════════════════════════════════════════
--- СТАРТ
--- ═══════════════════════════════════════════════════════════════════
-
-if USE_RAW then
-    task.spawn(dump_luraph_payload)
-end
-
-if INVISIBLE then hide_char() end
+global.__TSB_Invisibility_LocalCleanup = cleanup
+updateButton()
